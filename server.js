@@ -15,6 +15,8 @@ const MODELS = [
   "gemini-3-flash-preview"
 ];
 
+const MODEL_TIMEOUT = 8000;
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 12 * 1024 * 1024 },
@@ -29,16 +31,15 @@ const upload = multer({
   }
 });
 
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
 function isTemporaryError(status, message = "") {
-  const text = message.toLowerCase();
+  const text = String(message).toLowerCase();
 
   return (
     [408, 429, 500, 502, 503, 504].includes(status) ||
     text.includes("overloaded") ||
     text.includes("high demand") ||
-    text.includes("temporarily unavailable")
+    text.includes("temporarily unavailable") ||
+    text.includes("timeout")
   );
 }
 
@@ -46,53 +47,71 @@ async function askGemini(model, prompt, image, mimeType) {
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": process.env.GEMINI_API_KEY
-    },
-    body: JSON.stringify({
-      contents: [{
-        parts: [
-          { text: prompt },
-          {
-            inline_data: {
-              mime_type: mimeType,
-              data: image
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), MODEL_TIMEOUT);
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": process.env.GEMINI_API_KEY
+      },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { text: prompt },
+            {
+              inline_data: {
+                mime_type: mimeType,
+                data: image
+              }
             }
-          }
-        ]
-      }],
-      generationConfig: {
-        temperature: 0.3,
-        maxOutputTokens: 1800
-      }
-    }),
-    signal: AbortSignal.timeout(90000)
-  });
+          ]
+        }],
+        generationConfig: {
+          temperature: 0.3,
+          maxOutputTokens: 1800
+        }
+      }),
+      signal: controller.signal
+    });
 
-  const data = await response.json().catch(() => ({}));
+    const data = await response.json().catch(() => ({}));
 
-  if (!response.ok) {
-    const error = new Error(
-      data.error?.message || `Ошибка Gemini: ${response.status}`
-    );
+    if (!response.ok) {
+      const error = new Error(
+        data.error?.message || `Ошибка Gemini: ${response.status}`
+      );
 
-    error.status = response.status;
+      error.status = response.status;
+      throw error;
+    }
+
+    const analysis = data.candidates?.[0]?.content?.parts
+      ?.map(part => part.text || "")
+      .join("\n")
+      .trim();
+
+    if (!analysis) {
+      throw new Error("Gemini не вернул текстовый ответ.");
+    }
+
+    return analysis;
+  } catch (error) {
+    if (error.name === "AbortError") {
+      const timeoutError = new Error(
+        `Модель ${model} не ответила за ${MODEL_TIMEOUT / 1000} секунд.`
+      );
+
+      timeoutError.status = 408;
+      throw timeoutError;
+    }
+
     throw error;
+  } finally {
+    clearTimeout(timer);
   }
-
-  const analysis = data.candidates?.[0]?.content?.parts
-    ?.map(part => part.text || "")
-    .join("\n")
-    .trim();
-
-  if (!analysis) {
-    throw new Error("Gemini не вернул текстовый ответ.");
-  }
-
-  return analysis;
 }
 
 app.get("/", (req, res) => {
@@ -107,19 +126,22 @@ app.get("/health", (req, res) => {
     status: "online",
     service: "AI ZOOM",
     ai: "Gemini",
-    fallbackModels: MODELS.length
+    fallbackModels: MODELS.length,
+    modelTimeoutSeconds: MODEL_TIMEOUT / 1000
   });
 });
 
 app.post("/analyze", upload.single("photo"), async (req, res) => {
   if (!process.env.GEMINI_API_KEY) {
     return res.status(500).json({
+      success: false,
       error: "Не указан GEMINI_API_KEY."
     });
   }
 
   if (!req.file) {
     return res.status(400).json({
+      success: false,
       error: "Фотография не получена."
     });
   }
@@ -143,76 +165,69 @@ app.post("/analyze", upload.single("photo"), async (req, res) => {
 
   let lastError = null;
 
-  for (const model of MODELS) {
-    // Две попытки для каждой модели при временной перегрузке.
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        console.log(
-          `Пробуем ${model}, попытка ${attempt}/2`
-        );
+  for (let index = 0; index < MODELS.length; index++) {
+    const model = MODELS[index];
 
-        const analysis = await askGemini(
-          model,
-          prompt,
-          base64Image,
-          req.file.mimetype
-        );
+    console.log(
+      `[AI ZOOM] Модель ${index + 1}/${MODELS.length}: ${model}`
+    );
 
-        console.log(`Успешный ответ от ${model}`);
+    try {
+      const analysis = await askGemini(
+        model,
+        prompt,
+        base64Image,
+        req.file.mimetype
+      );
 
-        return res.json({
-          success: true,
-          model,
-          analysis
-        });
+      console.log(`[AI ZOOM] Успешный ответ: ${model}`);
 
-      } catch (error) {
-        lastError = error;
+      return res.json({
+        success: true,
+        model,
+        analysis
+      });
 
-        console.error(
-          `${model}, попытка ${attempt}:`,
-          error.message
-        );
+    } catch (error) {
+      lastError = error;
 
-        const temporary = isTemporaryError(
-          error.status,
-          error.message
-        );
+      console.error(
+        `[AI ZOOM] ${model}: ${error.message}`
+      );
 
-        // Если ошибка не временная, пробуем следующую модель.
-        if (!temporary) {
-          break;
-        }
-
-        // При временной ошибке ждём и повторяем запрос.
-        if (attempt < 2) {
-          await sleep(1200);
-        }
+      if (!isTemporaryError(error.status, error.message)) {
+        console.error("[AI ZOOM] Ошибка не временная, проверяем следующую модель.");
+      } else {
+        console.log("[AI ZOOM] Модель недоступна, переключаемся дальше.");
       }
     }
   }
 
-  console.error("Все модели Gemini недоступны:", lastError);
+  console.error("[AI ZOOM] Все модели исчерпаны.");
 
-  const message = lastError?.message || "Все модели временно недоступны.";
-
-  return res.status(503).json({
-    success: false,
-    error: `Не удалось получить ответ от Gemini. ${message}`,
-    triedModels: MODELS
-  });
+  if (!res.headersSent) {
+    return res.status(503).json({
+      success: false,
+      error: "Все резервные модели Gemini временно недоступны. Попробуй позже.",
+      triedModels: MODELS
+    });
+  }
 });
 
 app.use((error, req, res, next) => {
-  console.error("Ошибка сервера:", error.message);
+  console.error("[AI ZOOM] Ошибка сервера:", error.message);
 
-  res.status(400).json({
-    error: error.message || "Ошибка загрузки фотографии."
-  });
+  if (!res.headersSent) {
+    res.status(400).json({
+      success: false,
+      error: error.message || "Ошибка загрузки фотографии."
+    });
+  }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("AI ZOOM SERVER");
   console.log(`Сервер запущен на порту ${PORT}`);
-  console.log("Резервные модели Gemini включены.");
+  console.log(`Резервных моделей: ${MODELS.length}`);
+  console.log(`Тайм-аут модели: ${MODEL_TIMEOUT / 1000} секунд`);
 });
