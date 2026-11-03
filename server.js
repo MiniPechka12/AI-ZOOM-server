@@ -7,7 +7,7 @@ const multer = require("multer");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const MODELS = [
+const ANALYSIS_MODELS = [
   "gemini-3.8-flash",
   "gemini-3.6-flash",
   "gemini-3.5-flash-lite",
@@ -15,13 +15,23 @@ const MODELS = [
   "gemini-3-flash-preview"
 ];
 
-const MODEL_TIMEOUT = 8000;
+const IMAGE_MODELS = [
+  "gemini-3.1-flash-image",
+  "gemini-3.1-flash-lite-image"
+];
+
+const ANALYSIS_TIMEOUT = 8000;
+const IMAGE_TIMEOUT = 90000;
 
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 12 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = ["image/jpeg", "image/png", "image/webp"];
+    const allowed = [
+      "image/jpeg",
+      "image/png",
+      "image/webp"
+    ];
 
     if (allowed.includes(file.mimetype)) {
       cb(null, true);
@@ -39,16 +49,22 @@ function isTemporaryError(status, message = "") {
     text.includes("overloaded") ||
     text.includes("high demand") ||
     text.includes("temporarily unavailable") ||
-    text.includes("timeout")
+    text.includes("timeout") ||
+    text.includes("rate limit") ||
+    text.includes("resource exhausted")
   );
 }
 
-async function askGemini(model, prompt, image, mimeType) {
+async function geminiRequest(model, parts, timeout, generationConfig) {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error("Не указан GEMINI_API_KEY.");
+  }
+
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), MODEL_TIMEOUT);
+  const timer = setTimeout(() => controller.abort(), timeout);
 
   try {
     const response = await fetch(url, {
@@ -59,20 +75,10 @@ async function askGemini(model, prompt, image, mimeType) {
       },
       body: JSON.stringify({
         contents: [{
-          parts: [
-            { text: prompt },
-            {
-              inline_data: {
-                mime_type: mimeType,
-                data: image
-              }
-            }
-          ]
+          role: "user",
+          parts
         }],
-        generationConfig: {
-          temperature: 0.3,
-          maxOutputTokens: 1800
-        }
+        generationConfig
       }),
       signal: controller.signal
     });
@@ -88,20 +94,11 @@ async function askGemini(model, prompt, image, mimeType) {
       throw error;
     }
 
-    const analysis = data.candidates?.[0]?.content?.parts
-      ?.map(part => part.text || "")
-      .join("\n")
-      .trim();
-
-    if (!analysis) {
-      throw new Error("Gemini не вернул текстовый ответ.");
-    }
-
-    return analysis;
+    return data;
   } catch (error) {
     if (error.name === "AbortError") {
       const timeoutError = new Error(
-        `Модель ${model} не ответила за ${MODEL_TIMEOUT / 1000} секунд.`
+        `Модель ${model} не ответила за ${timeout / 1000} секунд.`
       );
 
       timeoutError.status = 408;
@@ -112,6 +109,100 @@ async function askGemini(model, prompt, image, mimeType) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function askGemini(model, prompt, image, mimeType) {
+  const data = await geminiRequest(
+    model,
+    [
+      { text: prompt },
+      {
+        inline_data: {
+          mime_type: mimeType,
+          data: image
+        }
+      }
+    ],
+    ANALYSIS_TIMEOUT,
+    {
+      temperature: 0.3,
+      maxOutputTokens: 1800
+    }
+  );
+
+  const analysis = data.candidates?.[0]?.content?.parts
+    ?.map(part => part.text || "")
+    .join("\n")
+    .trim();
+
+  if (!analysis) {
+    throw new Error("Gemini не вернул текстовый ответ.");
+  }
+
+  return analysis;
+}
+
+async function enhanceWithGemini(model, image, mimeType) {
+  const prompt = `
+You are a careful photo restoration assistant.
+
+Edit the supplied photograph with a conservative restoration approach.
+
+STRICT REQUIREMENTS:
+- Preserve the original scene and composition.
+- Do not add, remove, replace, or move any objects.
+- Do not change faces, identity, facial features, expressions, or body proportions.
+- Do not rewrite, invent, or alter any text, signs, labels, or numbers.
+- Do not change clothing, background, architecture, or object shapes.
+- Do not apply artistic styles or cinematic effects.
+- Do not create imaginary details.
+
+Only make restrained image-quality improvements:
+- reduce visible digital noise;
+- improve natural sharpness;
+- improve clarity without artificial edges;
+- correct mild exposure and white balance issues;
+- preserve natural colors and realistic textures.
+
+The result must look like the same original photograph,
+with only subtle technical quality improvements.
+
+Return the edited photograph, not a description.
+`;
+
+  const data = await geminiRequest(
+    model,
+    [
+      { text: prompt },
+      {
+        inline_data: {
+          mime_type: mimeType,
+          data: image
+        }
+      }
+    ],
+    IMAGE_TIMEOUT,
+    {
+      responseModalities: ["IMAGE"]
+    }
+  );
+
+  const parts = data.candidates?.[0]?.content?.parts || [];
+
+  const imagePart = parts.find(
+    part => part.inlineData?.data || part.inline_data?.data
+  );
+
+  if (!imagePart) {
+    throw new Error("Модель не вернула обработанное изображение.");
+  }
+
+  const inlineData = imagePart.inlineData || imagePart.inline_data;
+
+  return {
+    image: inlineData.data,
+    mimeType: inlineData.mimeType || inlineData.mime_type || "image/png"
+  };
 }
 
 app.get("/", (req, res) => {
@@ -125,9 +216,13 @@ app.get("/health", (req, res) => {
   res.json({
     status: "online",
     service: "AI ZOOM",
-    ai: "Gemini",
-    fallbackModels: MODELS.length,
-    modelTimeoutSeconds: MODEL_TIMEOUT / 1000
+    analysisModels: ANALYSIS_MODELS,
+    imageModels: IMAGE_MODELS,
+    features: {
+      analysis: true,
+      cloudEnhancement: true,
+      offlineEnhancement: false
+    }
   });
 });
 
@@ -163,13 +258,11 @@ app.post("/analyze", upload.single("photo"), async (req, res) => {
 Отвечай на русском языке и структурируй ответ.
 `;
 
-  let lastError = null;
-
-  for (let index = 0; index < MODELS.length; index++) {
-    const model = MODELS[index];
+  for (let index = 0; index < ANALYSIS_MODELS.length; index++) {
+    const model = ANALYSIS_MODELS[index];
 
     console.log(
-      `[AI ZOOM] Модель ${index + 1}/${MODELS.length}: ${model}`
+      `[AI ZOOM] Анализ ${index + 1}/${ANALYSIS_MODELS.length}: ${model}`
     );
 
     try {
@@ -180,38 +273,80 @@ app.post("/analyze", upload.single("photo"), async (req, res) => {
         req.file.mimetype
       );
 
-      console.log(`[AI ZOOM] Успешный ответ: ${model}`);
+      console.log(`[AI ZOOM] Анализ выполнен: ${model}`);
 
       return res.json({
         success: true,
         model,
         analysis
       });
-
     } catch (error) {
-      lastError = error;
-
-      console.error(
-        `[AI ZOOM] ${model}: ${error.message}`
-      );
+      console.error(`[AI ZOOM] ${model}: ${error.message}`);
 
       if (!isTemporaryError(error.status, error.message)) {
-        console.error("[AI ZOOM] Ошибка не временная, проверяем следующую модель.");
-      } else {
-        console.log("[AI ZOOM] Модель недоступна, переключаемся дальше.");
+        console.log("[AI ZOOM] Проверяем следующую модель.");
       }
     }
   }
 
-  console.error("[AI ZOOM] Все модели исчерпаны.");
+  return res.status(503).json({
+    success: false,
+    error: "Все модели анализа временно недоступны."
+  });
+});
 
-  if (!res.headersSent) {
-    return res.status(503).json({
+app.post("/enhance", upload.single("photo"), async (req, res) => {
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(500).json({
       success: false,
-      error: "Все резервные модели Gemini временно недоступны. Попробуй позже.",
-      triedModels: MODELS
+      error: "Не указан GEMINI_API_KEY."
     });
   }
+
+  if (!req.file) {
+    return res.status(400).json({
+      success: false,
+      error: "Фотография не получена."
+    });
+  }
+
+  const base64Image = req.file.buffer.toString("base64");
+
+  for (let index = 0; index < IMAGE_MODELS.length; index++) {
+    const model = IMAGE_MODELS[index];
+
+    console.log(
+      `[AI ZOOM] Улучшение ${index + 1}/${IMAGE_MODELS.length}: ${model}`
+    );
+
+    try {
+      const result = await enhanceWithGemini(
+        model,
+        base64Image,
+        req.file.mimetype
+      );
+
+      console.log(`[AI ZOOM] Изображение обработано: ${model}`);
+
+      return res.json({
+        success: true,
+        model,
+        mimeType: result.mimeType,
+        image: result.image
+      });
+    } catch (error) {
+      console.error(`[AI ZOOM] Ошибка ${model}: ${error.message}`);
+
+      if (!isTemporaryError(error.status, error.message)) {
+        console.log("[AI ZOOM] Проверяем резервную модель.");
+      }
+    }
+  }
+
+  return res.status(503).json({
+    success: false,
+    error: "Все облачные модели улучшения временно недоступны."
+  });
 });
 
 app.use((error, req, res, next) => {
@@ -228,6 +363,6 @@ app.use((error, req, res, next) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log("AI ZOOM SERVER");
   console.log(`Сервер запущен на порту ${PORT}`);
-  console.log(`Резервных моделей: ${MODELS.length}`);
-  console.log(`Тайм-аут модели: ${MODEL_TIMEOUT / 1000} секунд`);
+  console.log(`Моделей анализа: ${ANALYSIS_MODELS.length}`);
+  console.log(`Моделей улучшения: ${IMAGE_MODELS.length}`);
 });
